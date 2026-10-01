@@ -537,21 +537,32 @@ def auto_sync_on_startup(years: int = 5, db_path: Optional[str] = None) -> Dict[
     Called upon backend/Streamlit launch to ensure data is up to date with zero manual intervention.
     Also ensures factor_metrics is synchronized up to the latest trade_date in daily_bar.
     """
+    init_db(db_path)
     latest = get_latest_trade_date(db_path)
     today = datetime.now().strftime("%Y%m%d")
     sync_res = {"status": "up_to_date", "latest_date": latest, "bars_added": 0, "financials_added": 0}
-    if latest is None or latest < today:
+    if latest is None:
+        # Cloud deployment without database in git: auto bootstrap in 2-3s
+        print("[Startup Hook] No database found in repo. Performing quick cloud bootstrap (2 years, 30 stocks)...")
+        sync_res = sync_market_data(years=2, n_stocks=30, db_path=db_path)
+    elif latest < today:
         print(f"[Startup Hook] Current latest date is {latest}. Triggering incremental sync up to {today}...")
         sync_res = sync_market_data(years=years, db_path=db_path)
 
     # Check if factor_metrics lags behind daily_bar
     conn = get_connection(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT MAX(trade_date) FROM factor_metrics;")
-    max_factor_d = cursor.fetchone()[0]
-    cursor.execute("SELECT DISTINCT trade_date FROM daily_bar WHERE trade_date > ? ORDER BY trade_date ASC;", (max_factor_d or "",))
-    missing_factor_dates = [r[0] for r in cursor.fetchall()]
-    conn.close()
+    missing_factor_dates = []
+    try:
+        cursor.execute("SELECT MAX(trade_date) FROM factor_metrics;")
+        row = cursor.fetchone()
+        max_factor_d = row[0] if row else None
+        cursor.execute("SELECT DISTINCT trade_date FROM daily_bar WHERE trade_date > ? ORDER BY trade_date ASC;", (max_factor_d or "",))
+        missing_factor_dates = [r[0] for r in cursor.fetchall()]
+    except sqlite3.OperationalError:
+        missing_factor_dates = []
+    finally:
+        conn.close()
 
     if missing_factor_dates:
         print(f"[Startup Hook] Found {len(missing_factor_dates)} dates in daily_bar without factor_metrics. Computing tail factors...")

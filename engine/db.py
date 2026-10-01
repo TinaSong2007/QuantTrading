@@ -13,11 +13,93 @@ from typing import Generator, Optional
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "warehouse.db")
 
 
+def ensure_db_extracted(db_path: Optional[str] = None) -> str:
+    """
+    Checks if the database file exists. If missing but a .gz archive exists (e.g. on Streamlit Cloud),
+    automatically extracts the database in ~0.5s so deployment is seamless.
+    """
+    path = db_path or DEFAULT_DB_PATH
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        gz_path = path + ".gz"
+        if os.path.exists(gz_path):
+            import gzip
+            import shutil
+            print(f"[Database] Found compressed archive {gz_path}. Extracting to {path}...")
+            with gzip.open(gz_path, "rb") as f_in:
+                with open(path, "wb") as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            print(f"[Database] Extraction complete ({os.path.getsize(path) / (1024*1024):.1f} MB).")
+    return path
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    """Initializes schema tables and indices on an active connection."""
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS daily_bar (
+        ts_code     TEXT NOT NULL,
+        trade_date  TEXT NOT NULL,  -- YYYYMMDD
+        open        REAL,
+        high        REAL,
+        low         REAL,
+        close       REAL,
+        pre_close   REAL,
+        vol         REAL,
+        amount      REAL,
+        adj_factor  REAL NOT NULL DEFAULT 1.0,
+        adj_close   REAL,
+        PRIMARY KEY (ts_code, trade_date)
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS financial_pit (
+        ts_code         TEXT NOT NULL,
+        ann_date        TEXT NOT NULL,
+        end_date        TEXT NOT NULL,
+        roe             REAL,
+        net_profit      REAL,
+        revenue         REAL,
+        ttm_net_profit  REAL,
+        roe_ttm         REAL,
+        PRIMARY KEY (ts_code, ann_date, end_date)
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS stock_basic (
+        ts_code         TEXT PRIMARY KEY,
+        name            TEXT,
+        industry        TEXT,
+        list_date       TEXT,
+        is_st           INTEGER DEFAULT 0,
+        market_board    TEXT DEFAULT 'Main'
+    );
+    """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS factor_metrics (
+        trade_date  TEXT NOT NULL,
+        ts_code     TEXT NOT NULL,
+        factor_name TEXT NOT NULL,
+        raw_val     REAL,
+        clean_val   REAL,
+        PRIMARY KEY (trade_date, ts_code, factor_name)
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(trade_date);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bar_code ON daily_bar(ts_code);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pit_ann ON financial_pit(ann_date);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pit_code ON financial_pit(ts_code);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_factor_name ON factor_metrics(factor_name, trade_date);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_factor_date ON factor_metrics(trade_date);")
+    conn.commit()
+
+
 def get_connection(db_path: Optional[str] = None, timeout: float = 30.0) -> sqlite3.Connection:
     """
     Returns a configured sqlite3 connection with WAL mode and high performance PRAGMAs.
+    Guarantees table existence so queries never fail with 'no such table'.
     """
-    path = db_path or DEFAULT_DB_PATH
+    path = ensure_db_extracted(db_path)
+    is_new = not os.path.exists(path) or os.path.getsize(path) == 0
     conn = sqlite3.connect(path, timeout=timeout)
     conn.row_factory = sqlite3.Row
 
@@ -26,6 +108,9 @@ def get_connection(db_path: Optional[str] = None, timeout: float = 30.0) -> sqli
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA cache_size=-64000;")  # 64MB cache
     conn.execute("PRAGMA temp_store=MEMORY;")
+
+    if is_new:
+        _init_schema(conn)
     return conn
 
 
@@ -50,92 +135,35 @@ def init_db(db_path: Optional[str] = None) -> None:
     Initializes database schema with the 4 core institutional quant tables and performance indices.
     """
     with get_db(db_path) as conn:
-        cursor = conn.cursor()
-
-        # 1. Daily Bar Table (with backward adjustment support)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS daily_bar (
-            ts_code     TEXT NOT NULL,
-            trade_date  TEXT NOT NULL,  -- YYYYMMDD
-            open        REAL,
-            high        REAL,
-            low         REAL,
-            close       REAL,
-            pre_close   REAL,
-            vol         REAL,
-            amount      REAL,
-            adj_factor  REAL NOT NULL,  -- Cumulative backward adjust factor
-            adj_close   REAL,           -- close * adj_factor
-            PRIMARY KEY (ts_code, trade_date)
-        );
-        """)
-
-        # 2. Point-in-Time (PIT) Financial Disclosures Table (with precomputed TTM)
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS financial_pit (
-            ts_code         TEXT NOT NULL,
-            ann_date        TEXT NOT NULL,  -- Announcement date (must be <= trade_date)
-            end_date        TEXT NOT NULL,  -- Fiscal period end date (e.g. 20241231)
-            roe             REAL,
-            net_profit      REAL,
-            revenue         REAL,
-            ttm_net_profit  REAL,           -- Precomputed rolling TTM net profit
-            roe_ttm         REAL,           -- Precomputed TTM ROE
-            PRIMARY KEY (ts_code, ann_date, end_date)
-        );
-        """)
-
-        # 3. Stock Basic & Industry Classification Table
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS stock_basic (
-            ts_code         TEXT PRIMARY KEY,
-            name            TEXT,
-            industry        TEXT,          -- Shenwan Level-1 Industry
-            list_date       TEXT,          -- Listing date YYYYMMDD
-            is_st           INTEGER DEFAULT 0, -- 0: Normal, 1: ST / *ST
-            market_board    TEXT DEFAULT 'Main' -- 'Main', 'ChiNext', 'STAR'
-        );
-        """)
-
-        # 4. Factor Metrics & Analytics Table
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS factor_metrics (
-            trade_date  TEXT NOT NULL,
-            ts_code     TEXT NOT NULL,
-            factor_name TEXT NOT NULL,
-            raw_val     REAL,
-            clean_val   REAL,          -- MAD winzorized + Z-scored + OLS neutralized residual
-            PRIMARY KEY (trade_date, ts_code, factor_name)
-        );
-        """)
-
-        # Performance Indices
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bar_date ON daily_bar(trade_date);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_bar_code ON daily_bar(ts_code);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pit_ann ON financial_pit(ann_date);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pit_code ON financial_pit(ts_code);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_factor_name ON factor_metrics(factor_name, trade_date);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_factor_date ON factor_metrics(trade_date);")
+        _init_schema(conn)
 
 
 def get_latest_trade_date(db_path: Optional[str] = None) -> Optional[str]:
     """Returns the latest trade_date recorded in daily_bar, or None if empty."""
     conn = get_connection(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT MAX(trade_date) FROM daily_bar;")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else None
+    try:
+        cursor.execute("SELECT MAX(trade_date) FROM daily_bar;")
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
 
 
 def get_earliest_trade_date(db_path: Optional[str] = None) -> Optional[str]:
     """Returns the earliest trade_date recorded in daily_bar, or None if empty."""
     conn = get_connection(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT MIN(trade_date) FROM daily_bar;")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else None
+    try:
+        cursor.execute("SELECT MIN(trade_date) FROM daily_bar;")
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
 
 
 def get_stock_latest_states(db_path: Optional[str] = None) -> dict[str, tuple[str, float, float]]:
@@ -158,20 +186,28 @@ def get_stock_latest_states(db_path: Optional[str] = None) -> dict[str, tuple[st
     FROM RankedBars
     WHERE rnk = 1;
     """
-    cursor.execute(sql)
-    rows = cursor.fetchall()
-    conn.close()
-    return {r["ts_code"]: (r["trade_date"], float(r["close"] or 10.0), float(r["adj_factor"] or 1.0)) for r in rows}
+    try:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        return {r["ts_code"]: (r["trade_date"], float(r["close"] or 10.0), float(r["adj_factor"] or 1.0)) for r in rows}
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
 
 
 def get_latest_financial_ann_date(db_path: Optional[str] = None) -> Optional[str]:
     """Returns the maximum announcement date (ann_date) recorded in financial_pit."""
     conn = get_connection(db_path)
     cursor = conn.cursor()
-    cursor.execute("SELECT MAX(ann_date) FROM financial_pit;")
-    row = cursor.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else None
+    try:
+        cursor.execute("SELECT MAX(ann_date) FROM financial_pit;")
+        row = cursor.fetchone()
+        return row[0] if row and row[0] else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
