@@ -130,6 +130,10 @@ def clean_factor_cross_section(
     resid, _ = neutralize_ols(y_z, industries, mv)
 
     # 5. Final residual standardization
-    clean_val = standardize_zscore(resid)
+    # Guard against overfitting/zero degrees of freedom (e.g. N <= 32 predictors)
+    if np.std(resid) > 1e-4:
+        clean_val = standardize_zscore(resid)
+    else:
+        clean_val = y_z
 
     return clean_df.with_columns(pl.Series("clean_val", clean_val))

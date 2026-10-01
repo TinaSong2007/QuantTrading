@@ -542,9 +542,9 @@ def auto_sync_on_startup(years: int = 5, db_path: Optional[str] = None) -> Dict[
     today = datetime.now().strftime("%Y%m%d")
     sync_res = {"status": "up_to_date", "latest_date": latest, "bars_added": 0, "financials_added": 0}
     if latest is None:
-        # Cloud deployment without database in git: auto bootstrap in 2-3s
-        print("[Startup Hook] No database found in repo. Performing quick cloud bootstrap (2 years, 30 stocks)...")
-        sync_res = sync_market_data(years=2, n_stocks=30, db_path=db_path)
+        # Cloud deployment without database in git: auto bootstrap 60 stocks for rich cross-sections in ~2-3s
+        print("[Startup Hook] No database found in repo. Performing quick cloud bootstrap (2 years, 60 stocks)...")
+        sync_res = sync_market_data(years=2, n_stocks=60, db_path=db_path)
     elif latest < today:
         print(f"[Startup Hook] Current latest date is {latest}. Triggering incremental sync up to {today}...")
         sync_res = sync_market_data(years=years, db_path=db_path)
